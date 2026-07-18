@@ -1,0 +1,11 @@
+name: expedition-bot
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:-}
+    volumes:
+      - .:/app
+      - /app/.venv
