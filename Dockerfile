@@ -14,6 +14,6 @@ RUN apt-get update \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY bot.py excel_parser.py image_renderer.py ./
+COPY bot.py excel_parser.py image_renderer.py route_store.py yandex_geocoder.py ./
 
 CMD ["uv", "run", "--no-sync", "python", "bot.py"]
