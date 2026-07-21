@@ -23,6 +23,8 @@ class RoutePoint:
     suggestions: list[Suggestion] | None = None
     address_confirmed: bool = False
     card_uri: str | None = None
+    completed_at: str | None = None
+    payment_received_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,9 @@ class Route:
     route_end_latitude: str | None = None
     route_end_longitude: str | None = None
     awaiting_route_endpoint: str | None = None
+    editing_route_endpoint: bool = False
+    awaiting_payment_confirmation: int | None = None
+    route_endpoint_prompt_message_id: int | None = None
 
 
 class RouteStore:
@@ -139,7 +144,9 @@ class RouteStore:
                     route,
                     route_start_latitude=geocode.latitude,
                     route_start_longitude=geocode.longitude,
-                    awaiting_route_endpoint="end",
+                    awaiting_route_endpoint=None if route.editing_route_endpoint else "end",
+                    editing_route_endpoint=False,
+                    route_endpoint_prompt_message_id=None,
                 )
             else:
                 updated = replace(
@@ -147,8 +154,43 @@ class RouteStore:
                     route_end_latitude=geocode.latitude,
                     route_end_longitude=geocode.longitude,
                     awaiting_route_endpoint=None,
-                    awaiting_mileage="start",
+                    awaiting_mileage="start"
+                    if not route.editing_route_endpoint and route.start_mileage is None
+                    else route.awaiting_mileage,
+                    editing_route_endpoint=False,
+                    route_endpoint_prompt_message_id=None,
                 )
+            data[str(chat_id)] = self._serialize(updated)
+            self._write(data)
+            return updated
+
+    async def set_route_endpoint_prompt_message(
+        self, chat_id: int, route_id: str, message_id: int
+    ) -> Route | None:
+        return await self._update_route_prompt_message(chat_id, route_id, message_id)
+
+    async def _update_route_prompt_message(self, chat_id: int, route_id: str, message_id: int) -> Route | None:
+        async with self._lock:
+            data = self._read()
+            raw_route = data.get(str(chat_id))
+            if not raw_route or raw_route.get("id") != route_id:
+                return None
+            route = self._deserialize(raw_route)
+            updated = replace(route, route_endpoint_prompt_message_id=message_id)
+            data[str(chat_id)] = self._serialize(updated)
+            self._write(data)
+            return updated
+
+    async def request_route_endpoint_update(self, chat_id: int, route_id: str, endpoint: str) -> Route | None:
+        if endpoint not in {"start", "end"}:
+            return None
+        async with self._lock:
+            data = self._read()
+            raw_route = data.get(str(chat_id))
+            if not raw_route or raw_route.get("id") != route_id:
+                return None
+            route = self._deserialize(raw_route)
+            updated = replace(route, awaiting_route_endpoint=endpoint, editing_route_endpoint=True)
             data[str(chat_id)] = self._serialize(updated)
             self._write(data)
             return updated
@@ -256,6 +298,8 @@ class RouteStore:
                 point.suggestions,
                 address_confirmed=address is not None or point.address_confirmed,
                 card_uri=card_uri or point.card_uri,
+                completed_at=point.completed_at,
+                payment_received_at=point.payment_received_at,
             )
             updated = replace(route, points=points, awaiting_coordinate_point=None)
             data[str(chat_id)] = self._serialize(updated)
@@ -269,6 +313,33 @@ class RouteStore:
         return await self._update_route(chat_id, route_id, selected_point=None)
 
     async def complete_point(self, chat_id: int, route_id: str, point_index: int) -> Route | None:
+        return await self._complete_point(chat_id, route_id, point_index, payment_confirmed=False)
+
+    async def request_payment_confirmation(self, chat_id: int, route_id: str, point_index: int) -> Route | None:
+        async with self._lock:
+            data = self._read()
+            raw_route = data.get(str(chat_id))
+            if not raw_route or raw_route.get("id") != route_id:
+                return None
+            route = self._deserialize(raw_route)
+            if point_index < 0 or point_index >= len(route.points):
+                return None
+            point = route.points[point_index]
+            if route.selected_point != point_index or point.delivered or not any(
+                order.payment.strip() and order.payment.strip().casefold() != "без оплаты" for order in point.orders
+            ):
+                return None
+            updated = replace(route, awaiting_payment_confirmation=point_index)
+            data[str(chat_id)] = self._serialize(updated)
+            self._write(data)
+            return updated
+
+    async def confirm_payment_and_complete(self, chat_id: int, route_id: str, point_index: int) -> Route | None:
+        return await self._complete_point(chat_id, route_id, point_index, payment_confirmed=True)
+
+    async def _complete_point(
+        self, chat_id: int, route_id: str, point_index: int, *, payment_confirmed: bool
+    ) -> Route | None:
         async with self._lock:
             data = self._read()
             raw_route = data.get(str(chat_id))
@@ -281,6 +352,15 @@ class RouteStore:
             point = points[point_index]
             if point.delivered or route.selected_point != point_index:
                 return None
+            requires_payment_confirmation = any(
+                order.payment.strip() and order.payment.strip().casefold() != "без оплаты" for order in point.orders
+            )
+            if requires_payment_confirmation:
+                if route.awaiting_payment_confirmation != point_index or not payment_confirmed:
+                    return None
+            elif payment_confirmed:
+                return None
+            completed_at = datetime.now(UTC).isoformat()
             points[point_index] = RoutePoint(
                 point.address,
                 point.orders,
@@ -291,6 +371,8 @@ class RouteStore:
                 suggestions=point.suggestions,
                 address_confirmed=point.address_confirmed,
                 card_uri=point.card_uri,
+                completed_at=completed_at,
+                payment_received_at=completed_at if payment_confirmed else None,
             )
             updated = replace(
                 route,
@@ -298,7 +380,27 @@ class RouteStore:
                 selected_point=None,
                 awaiting_mileage="final" if all(item.delivered for item in points) else None,
                 awaiting_coordinate_point=None,
+                awaiting_payment_confirmation=None,
             )
+            data[str(chat_id)] = self._serialize(updated)
+            self._write(data)
+            return updated
+
+    async def restore_point(self, chat_id: int, route_id: str, point_index: int) -> Route | None:
+        async with self._lock:
+            data = self._read()
+            raw_route = data.get(str(chat_id))
+            if not raw_route or raw_route.get("id") != route_id:
+                return None
+            route = self._deserialize(raw_route)
+            if point_index < 0 or point_index >= len(route.points):
+                return None
+            point = route.points[point_index]
+            if not point.delivered:
+                return None
+            points = list(route.points)
+            points[point_index] = replace(point, delivered=False, completed_at=None, payment_received_at=None)
+            updated = replace(route, points=points, awaiting_mileage=None, awaiting_payment_confirmation=None)
             data[str(chat_id)] = self._serialize(updated)
             self._write(data)
             return updated
@@ -320,6 +422,7 @@ class RouteStore:
                 route,
                 selected_point=selected_point,
                 awaiting_coordinate_point=route.awaiting_coordinate_point if selected_point is not None else None,
+                awaiting_payment_confirmation=None,
             )
             data[str(chat_id)] = self._serialize(updated)
             self._write(data)
@@ -360,6 +463,8 @@ class RouteStore:
                     suggestions=[Suggestion(**suggestion) for suggestion in point.get("suggestions") or []] or None,
                     address_confirmed=point.get("address_confirmed", False),
                     card_uri=point.get("card_uri"),
+                    completed_at=point.get("completed_at"),
+                    payment_received_at=point.get("payment_received_at"),
                 )
                 for point in value["points"]
             ],
@@ -374,4 +479,7 @@ class RouteStore:
             route_end_latitude=value.get("route_end_latitude"),
             route_end_longitude=value.get("route_end_longitude"),
             awaiting_route_endpoint=value.get("awaiting_route_endpoint"),
+            editing_route_endpoint=value.get("editing_route_endpoint", False),
+            awaiting_payment_confirmation=value.get("awaiting_payment_confirmation"),
+            route_endpoint_prompt_message_id=value.get("route_endpoint_prompt_message_id"),
         )

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -42,10 +43,36 @@ ROUTE_STORE = RouteStore(Path("data/routes.json"))
 POINTS_PER_PAGE = 8
 
 
+async def _delete_user_message(update: Update) -> None:
+    if not update.message:
+        return
+    try:
+        await update.message.delete()
+    except TelegramError:
+        logger.warning("Could not delete message %s", update.message.message_id)
+
+
+async def _ask_route_endpoint(update: Update, route: Route) -> None:
+    if not update.effective_message or not update.effective_chat:
+        return
+    prompt = await update.effective_message.reply_text(_route_endpoint_prompt(route))
+    await ROUTE_STORE.set_route_endpoint_prompt_message(update.effective_chat.id, route.id, prompt.message_id)
+
+
+async def _delete_route_endpoint_prompt(context: ContextTypes.DEFAULT_TYPE, route: Route) -> None:
+    if route.route_endpoint_prompt_message_id is None:
+        return
+    try:
+        await context.bot.delete_message(route.chat_id, route.route_endpoint_prompt_message_id)
+    except TelegramError:
+        logger.warning("Could not delete route endpoint prompt %s", route.route_endpoint_prompt_message_id)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Сегодня {_route_date()}. Пришлите Excel-файл .xlsx, а я соберу удобные карточки заказов для водителя."
     )
+    await _delete_user_message(update)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -57,8 +84,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not file_name.lower().endswith(".xlsx"):
         await update.message.reply_text("Нужен файл Excel в формате .xlsx.")
         return
-
-    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -79,35 +104,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text("В файле не нашел строк с заказами.")
             return
 
-        await _send_orders(update, orders, tmp_path, file_name)
-async def _send_orders(update: Update, orders: list[Order], tmp_path: Path, source_name: str) -> None:
+        await _send_orders(update, orders)
+
+
+async def _send_orders(update: Update, orders: list[Order]) -> None:
     if not update.message or not update.effective_chat:
         return
-    try:
-        image_paths = render_orders(orders, tmp_path)
-    except Exception:
-        logger.exception("Failed to render %s", source_name)
-        await update.message.reply_text("Таблицу прочитал, но не смог собрать изображение.")
-        return
-
-    caption = f"Готово: {len(orders)} заказов."
-    if len(image_paths) == 1:
-        with image_paths[0].open("rb") as image_file:
-            await update.message.reply_photo(photo=image_file, caption=caption)
-    else:
-        for batch_start in range(0, len(image_paths), 10):
-            image_batch = image_paths[batch_start : batch_start + 10]
-            with ExitStack() as stack:
-                media = [
-                    InputMediaPhoto(
-                        media=stack.enter_context(image_path.open("rb")),
-                        caption=caption if batch_start == 0 and index == 0 else None,
-                    )
-                    for index, image_path in enumerate(image_batch)
-                ]
-                await update.message.reply_media_group(media)
-            await asyncio.sleep(0.2)
-
     addresses_by_key: dict[str, str] = {}
     for order in orders:
         address = order.address or "Адрес не указан"
@@ -123,12 +125,13 @@ async def _send_orders(update: Update, orders: list[Order], tmp_path: Path, sour
             _suggestion_prompt(route), reply_markup=_suggestion_keyboard(route, route.awaiting_suggestion)
         )
     else:
-        await _notify_about_coordinate_refinement(update, route)
-        await update.message.reply_text(_route_endpoint_prompt(route))
+        if not await _notify_about_coordinate_refinement(update, route):
+            await _ask_route_endpoint(update, route)
 
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Отправьте Excel-файл .xlsx документом.")
+    await _delete_user_message(update)
 
 
 async def handle_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -157,6 +160,7 @@ async def handle_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "Не удалось определить координаты. Отправьте ссылку на точку из Яндекс Навигатора "
                 "или укажите адрес точнее."
             )
+            await _delete_user_message(update)
             return
         if address is None:
             updated = await ROUTE_STORE.save_manual_coordinates(update.effective_chat.id, point_index, geocode)
@@ -165,17 +169,22 @@ async def handle_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 update.effective_chat.id, point_index, address, geocode, card_uri
             )
         if not updated:
+            await _delete_user_message(update)
             return
         point = updated.points[point_index]
         if updated.awaiting_route_endpoint:
-            await update.message.reply_text(_route_endpoint_prompt(updated))
+            if not await _notify_about_coordinate_refinement(update, updated):
+                await _ask_route_endpoint(update, updated)
+            await _delete_user_message(update)
             return
         if updated.awaiting_mileage == "start":
             await update.message.reply_text("Координаты уточнены. Введите стартовый пробег автомобиля в километрах.")
+            await _delete_user_message(update)
             return
         await update.message.reply_text(
             _point_details(point), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_point_keyboard(updated, point_index)
         )
+        await _delete_user_message(update)
         return
     if route and route.awaiting_route_endpoint:
         value = update.message.text.strip()
@@ -188,16 +197,26 @@ async def handle_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         geocode = lookup.geocode if lookup else None
         if not geocode or not geocode.latitude or not geocode.longitude:
             await update.message.reply_text("Не удалось найти точку. Укажите адрес точнее.")
+            await _delete_user_message(update)
             return
         updated = await ROUTE_STORE.save_route_endpoint(
             update.effective_chat.id, route.awaiting_route_endpoint, geocode
         )
         if not updated:
+            await _delete_user_message(update)
             return
+        await _delete_route_endpoint_prompt(context, route)
         if updated.awaiting_route_endpoint:
-            await update.message.reply_text(_route_endpoint_prompt(updated))
-        else:
+            await _ask_route_endpoint(update, updated)
+        elif updated.awaiting_mileage == "start":
             await update.message.reply_text("Введите стартовый пробег автомобиля в километрах.")
+        else:
+            await update.message.reply_text(
+                _points_prompt(updated),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=_points_keyboard(updated),
+            )
+        await _delete_user_message(update)
         return
     if not route or not route.awaiting_mileage:
         await handle_other(update, context)
@@ -206,26 +225,34 @@ async def handle_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     mileage = _parse_mileage(update.message.text)
     if mileage is None:
         await update.message.reply_text("Введите пробег числом в километрах, например: 125430.5")
+        await _delete_user_message(update)
         return
     if route.awaiting_mileage == "final" and route.start_mileage is not None:
         if mileage < Decimal(route.start_mileage):
             await update.message.reply_text("Финальный пробег не может быть меньше стартового. Введите значение еще раз.")
+            await _delete_user_message(update)
             return
 
     updated = await ROUTE_STORE.save_mileage(update.effective_chat.id, _format_mileage(mileage))
     if not updated:
+        await _delete_user_message(update)
         return
     if updated.final_mileage is not None and updated.start_mileage is not None:
         distance = Decimal(updated.final_mileage) - Decimal(updated.start_mileage)
         await update.message.reply_text(
             f"Маршрут от {_route_date()} завершен. Пройдено: {_format_mileage(distance)} км."
         )
+        await update.message.reply_text(_completed_points_summary(updated), parse_mode=ParseMode.MARKDOWN_V2)
         return
-    await update.message.reply_text(
-        _points_prompt(updated),
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=_points_keyboard(updated),
-    )
+    await _send_route_cards_and_points(update, updated)
+
+
+async def _edit_route_message(query, text: str, **kwargs) -> None:
+    if query.message and query.message.photo:
+        await query.message.reply_text(text, **kwargs)
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+    await query.edit_message_text(text, **kwargs)
 
 
 async def handle_route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -240,27 +267,60 @@ async def handle_route_callback(update: Update, context: ContextTypes.DEFAULT_TY
     _, route_id, action, value = parts
     route = await ROUTE_STORE.get_route(update.effective_chat.id, route_id)
     if route is None:
-        await query.edit_message_text("Этот маршрут больше недоступен. Отправьте Excel-файл заново.")
+        await _edit_route_message(query, "Этот маршрут больше недоступен. Отправьте Excel-файл заново.")
         return
 
     if action == "page":
-        await query.edit_message_text(
+        await _edit_route_message(
+            query,
             _points_prompt(route), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_points_keyboard(route, int(value))
         )
+        return
+    if action == "archive":
+        await _edit_route_message(
+            query,
+            _archive_prompt(route), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_archive_keyboard(route, int(value))
+        )
+        return
+    if action == "restore":
+        try:
+            page, point_index = (int(item) for item in value.split("-", maxsplit=1))
+        except ValueError:
+            return
+        route = await ROUTE_STORE.restore_point(update.effective_chat.id, route_id, point_index)
+        if route is None:
+            await _edit_route_message(query, "Точка уже возвращена в работу или недоступна.")
+            return
+        if any(point.delivered for point in route.points):
+            await _edit_route_message(
+                query,
+                _archive_prompt(route, "Точка возвращена в работу."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=_archive_keyboard(route, page),
+            )
+        else:
+            await _edit_route_message(
+                query,
+                _points_prompt(route, "Точка возвращена в работу. Архив пуст."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=_points_keyboard(route),
+            )
         return
     if action == "select":
         route = await ROUTE_STORE.select_point(update.effective_chat.id, route_id, int(value))
         if route is None:
             current_route = await ROUTE_STORE.get_route(update.effective_chat.id, route_id)
             if current_route:
-                await query.edit_message_text(
+                await _edit_route_message(
+                    query,
                     _points_prompt(current_route, "Точка уже выполнена или недоступна."),
                     parse_mode=ParseMode.MARKDOWN_V2,
                     reply_markup=_points_keyboard(current_route),
                 )
             return
         point = route.points[int(value)]
-        await query.edit_message_text(
+        await _edit_route_message(
+            query,
             _point_details(point),
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_point_keyboard(route, int(value)),
@@ -269,41 +329,78 @@ async def handle_route_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "back":
         route = await ROUTE_STORE.clear_selection(update.effective_chat.id, route_id)
         if route:
-            await query.edit_message_text(
+            await _edit_route_message(
+                query,
                 _points_prompt(route), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_points_keyboard(route, int(value))
             )
         return
     if action == "refine":
         route = await ROUTE_STORE.request_coordinate_refinement(update.effective_chat.id, route_id, int(value))
         if route:
-            await query.edit_message_text(
+            await _edit_route_message(
+                query,
                 "Отправьте ссылку на карточку точки из Яндекс Навигатора.\n"
                 "Или напишите точный адрес — я найду его через API.",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Назад к точкам", callback_data=f"route:{route.id}:refineback:0")]]
+                    [[InlineKeyboardButton("← Назад к точкам", callback_data=f"route:{route.id}:refineback:0")]]
                 ),
             )
         return
     if action == "refineback":
         route = await ROUTE_STORE.cancel_coordinate_refinement(update.effective_chat.id, route_id)
         if route:
-            await query.edit_message_text(
+            await _edit_route_message(
+                query,
                 _coordinate_refinement_prompt(route), reply_markup=_coordinate_refinement_keyboard(route)
             )
         return
-    if action == "complete":
-        route = await ROUTE_STORE.complete_point(update.effective_chat.id, route_id, int(value))
-        if route is None:
-            await query.edit_message_text("Точка уже недоступна. Выберите другую.")
+    if action == "endpoint":
+        route = await ROUTE_STORE.request_route_endpoint_update(update.effective_chat.id, route_id, value)
+        if route:
+            await _ask_route_endpoint(update, route)
+        return
+    if action in {"complete", "payment"}:
+        point_index = int(value)
+        if action == "complete" and any(
+            order.payment.strip() and order.payment.strip().casefold() != "без оплаты"
+            for order in route.points[point_index].orders
+        ):
+            route = await ROUTE_STORE.request_payment_confirmation(update.effective_chat.id, route_id, point_index)
+            if route:
+                await _edit_route_message(
+                    query,
+                    "В заказе указана оплата. Подтвердите, что получение денег зафиксировано.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "✅ Получение денег зафиксировано",
+                                    callback_data=f"route:{route.id}:payment:{point_index}",
+                                )
+                            ],
+                            [InlineKeyboardButton("← Назад", callback_data=f"route:{route.id}:back:0")],
+                        ]
+                    ),
+                )
             return
+        if action == "payment":
+            route = await ROUTE_STORE.confirm_payment_and_complete(update.effective_chat.id, route_id, point_index)
+        else:
+            route = await ROUTE_STORE.complete_point(update.effective_chat.id, route_id, point_index)
+        if route is None:
+            await _edit_route_message(query, "Точка уже недоступна. Выберите другую.")
+            return
+        completed_at = _completed_time(route.points[point_index].completed_at)
         if all(point.delivered for point in route.points):
-            await query.edit_message_text(
-                f"Все точки маршрутного листа выполнены. Дата маршрута: {_route_date()}. "
+            await _edit_route_message(
+                query,
+                f"Заказ выполнен в {completed_at}. Все точки маршрутного листа выполнены. Дата маршрута: {_route_date()}. "
                 "Введите финальный пробег автомобиля в километрах."
             )
             return
-        await query.edit_message_text(
-            _points_prompt(route, "Заказ выполнен. Выберите следующую точку."),
+        await _edit_route_message(
+            query,
+            _points_prompt(route, f"Заказ выполнен в {completed_at}. Выберите следующую точку."),
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_points_keyboard(route),
         )
@@ -344,8 +441,51 @@ async def handle_suggestion_callback(update: Update, context: ContextTypes.DEFAU
             _suggestion_prompt(route), reply_markup=_suggestion_keyboard(route, route.awaiting_suggestion)
         )
         return
-    await query.edit_message_text("Адреса уточнены. Укажите стартовую точку маршрута текстом.")
-    await _notify_about_coordinate_refinement(update, route)
+    if await _notify_about_coordinate_refinement(update, route):
+        await query.edit_message_text("Адреса уточнены.")
+    else:
+        await query.edit_message_text("Адреса уточнены. Укажите стартовую точку маршрута текстом.")
+
+
+async def _send_route_cards_and_points(update: Update, route: Route) -> None:
+    if not update.effective_message or not update.effective_chat:
+        return
+    orders = [order for point in route.points for order in point.orders]
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
+            image_paths = render_orders(orders, Path(tmp_dir))
+            if len(image_paths) == 1:
+                with image_paths[0].open("rb") as image_file:
+                    await update.effective_message.reply_photo(
+                        photo=image_file,
+                        caption=_points_prompt(route),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=_points_keyboard(route),
+                    )
+                return
+
+            for batch_start in range(0, len(image_paths), 10):
+                image_batch = image_paths[batch_start : batch_start + 10]
+                with ExitStack() as stack:
+                    media = [
+                        InputMediaPhoto(
+                            media=stack.enter_context(image_path.open("rb")),
+                            caption=f"Готово: {len(orders)} заказов." if batch_start == 0 and index == 0 else None,
+                        )
+                        for index, image_path in enumerate(image_batch)
+                    ]
+                    await update.effective_message.reply_media_group(media)
+                await asyncio.sleep(0.2)
+    except Exception:
+        logger.exception("Failed to render route cards")
+        await update.effective_message.reply_text("Не удалось собрать карточки заказов.")
+
+    await update.effective_message.reply_text(
+        _points_prompt(route),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_points_keyboard(route),
+    )
 
 
 def _points_keyboard(route: Route, page: int = 0) -> InlineKeyboardMarkup:
@@ -360,11 +500,41 @@ def _points_keyboard(route: Route, page: int = 0) -> InlineKeyboardMarkup:
     if page_count > 1:
         navigation = []
         if page > 0:
-            navigation.append(InlineKeyboardButton("Назад", callback_data=f"route:{route.id}:page:{page - 1}"))
+            navigation.append(InlineKeyboardButton("← Назад", callback_data=f"route:{route.id}:page:{page - 1}"))
         navigation.append(InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data=f"route:{route.id}:page:{page}"))
         if page < page_count - 1:
-            navigation.append(InlineKeyboardButton("Далее", callback_data=f"route:{route.id}:page:{page + 1}"))
+            navigation.append(InlineKeyboardButton("Далее →", callback_data=f"route:{route.id}:page:{page + 1}"))
         buttons.append(navigation)
+    buttons.extend(
+        [
+            [InlineKeyboardButton("🗂 Архив выполненных точек", callback_data=f"route:{route.id}:archive:0")],
+            [
+                InlineKeyboardButton("⚙️ Стартовая точка", callback_data=f"route:{route.id}:endpoint:start"),
+                InlineKeyboardButton("⚙️ Конечная точка", callback_data=f"route:{route.id}:endpoint:end"),
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def _archive_keyboard(route: Route, page: int = 0) -> InlineKeyboardMarkup:
+    completed = [(index, point) for index, point in enumerate(route.points) if point.delivered]
+    page_count = max(1, (len(completed) + POINTS_PER_PAGE - 1) // POINTS_PER_PAGE)
+    page = min(max(page, 0), page_count - 1)
+    chunk = completed[page * POINTS_PER_PAGE : (page + 1) * POINTS_PER_PAGE]
+    buttons = [
+        [InlineKeyboardButton(f"↩️ Вернуть в работу: {point.address}", callback_data=f"route:{route.id}:restore:{page}-{index}")]
+        for index, point in chunk
+    ]
+    if page_count > 1:
+        navigation = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton("← Назад", callback_data=f"route:{route.id}:archive:{page - 1}"))
+        navigation.append(InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data=f"route:{route.id}:archive:{page}"))
+        if page < page_count - 1:
+            navigation.append(InlineKeyboardButton("Далее →", callback_data=f"route:{route.id}:archive:{page + 1}"))
+        buttons.append(navigation)
+    buttons.append([InlineKeyboardButton("← К выбору точек", callback_data=f"route:{route.id}:page:0")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -374,7 +544,13 @@ def _points_prompt(route: Route, message: str = "Выберите точку, в
         for point in route.points
         if not point.delivered and point.latitude and point.longitude
     ]
-    if route.route_start_latitude and route.route_start_longitude:
+    completed_points = [
+        point for point in route.points if point.delivered and point.latitude and point.longitude
+    ]
+    if completed_points:
+        last_completed = max(completed_points, key=lambda point: point.completed_at or "")
+        coordinates.insert(0, f"{last_completed.latitude},{last_completed.longitude}")
+    elif route.route_start_latitude and route.route_start_longitude:
         coordinates.insert(0, f"{route.route_start_latitude},{route.route_start_longitude}")
     if route.route_end_latitude and route.route_end_longitude:
         coordinates.append(f"{route.route_end_latitude},{route.route_end_longitude}")
@@ -383,12 +559,39 @@ def _points_prompt(route: Route, message: str = "Выберите точку, в
     return f"[Построить маршрут в Яндекс Навигаторе]({_route_navigator_link(coordinates)})\n\n{_markdown(message)}"
 
 
+def _archive_prompt(route: Route, message: str = "Выберите точку, которую нужно вернуть в работу.") -> str:
+    completed = _completed_points_in_order(route)
+    if not completed:
+        return _markdown("Архив выполненных точек пуст.")
+    lines = ["*АРХИВ ВЫПОЛНЕННЫХ ТОЧЕК*"]
+    lines.extend(
+        f"• {_markdown(point.address)}\n  Выполнено: {_markdown(_completed_time(point.completed_at))}"
+        for point in completed
+    )
+    lines.extend(["", _markdown(message)])
+    return "\n".join(lines)
+
+
+def _completed_points_summary(route: Route) -> str:
+    completed = _completed_points_in_order(route)
+    lines = ["*ВЫПОЛНЕННЫЕ ТОЧКИ*"]
+    lines.extend(
+        f"{position}\\. {_markdown(point.address)} — {_markdown(_completed_time(point.completed_at))}"
+        for position, point in enumerate(completed, start=1)
+    )
+    return "\n".join(lines)
+
+
+def _completed_points_in_order(route: Route) -> list[RoutePoint]:
+    return sorted((point for point in route.points if point.delivered), key=lambda point: point.completed_at or "")
+
+
 def _point_keyboard(route: Route, point_index: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("УТОЧНИТЬ КООРДИНАТЫ", callback_data=f"route:{route.id}:refine:{point_index}")],
-            [InlineKeyboardButton("ЗАКАЗ ВЫПОЛНЕН", callback_data=f"route:{route.id}:complete:{point_index}")],
-            [InlineKeyboardButton("Выбрать другую точку", callback_data=f"route:{route.id}:back:0")],
+            [InlineKeyboardButton("📍 Уточнить координаты", callback_data=f"route:{route.id}:refine:{point_index}")],
+            [InlineKeyboardButton("✅ Заказ выполнен", callback_data=f"route:{route.id}:complete:{point_index}")],
+            [InlineKeyboardButton("← Выбрать другую точку", callback_data=f"route:{route.id}:back:0")],
         ]
     )
 
@@ -408,15 +611,16 @@ def _suggestion_keyboard(route: Route, point_index: int) -> InlineKeyboardMarkup
     )
 
 
-async def _notify_about_coordinate_refinement(update: Update, route: Route) -> None:
+async def _notify_about_coordinate_refinement(update: Update, route: Route) -> bool:
     points = [point.address for point in route.points if _needs_coordinate_refinement(point)]
     if not points:
-        return
+        return False
     addresses = "\n".join(f"• {address}" for address in points)
     await update.effective_message.reply_text(
         _coordinate_refinement_prompt(route, addresses),
         reply_markup=_coordinate_refinement_keyboard(route),
     )
+    return True
 
 
 def _needs_coordinate_refinement(point: RoutePoint) -> bool:
@@ -461,10 +665,10 @@ def _point_details(point: RoutePoint) -> str:
     if point.geocode_quality:
         lines.append(f"*Геокодирование:* {_markdown(point.geocode_quality)}")
     lines.append("")
-    for position, order in enumerate(point.orders, start=1):
+    for order in point.orders:
         lines.extend(
             [
-                f"*ЗАКАЗ {position}*  \\#{_markdown(order.number or 'без номера')}",
+                f"*ЗАКАЗ*  \\#{_markdown(order.number or 'без номера')}",
                 f"*Получатель:* {_markdown(order.recipient or 'не указан')}",
                 f"*Мест:* {_markdown(order.places or 'не указано')}",
             ]
@@ -477,7 +681,7 @@ def _point_details(point: RoutePoint) -> str:
             lines.append(f"*Время работы:* {_markdown(order.hours)}")
         if order.extra:
             lines.append(f"*Доп\\. информация:* {_markdown(order.extra)}")
-        if position < len(point.orders):
+        if order is not point.orders[-1]:
             lines.append("")
     return "\n".join(lines)
 
@@ -511,6 +715,15 @@ def _parse_mileage(value: str) -> Decimal | None:
 
 def _format_mileage(value: Decimal) -> str:
     return format(value, "f").rstrip("0").rstrip(".") or "0"
+
+
+def _completed_time(value: str | None) -> str:
+    if not value:
+        return "только что"
+    try:
+        return datetime.fromisoformat(value).astimezone(ZoneInfo("Asia/Krasnoyarsk")).strftime("%H:%M")
+    except ValueError:
+        return "только что"
 
 
 def _route_date() -> str:
