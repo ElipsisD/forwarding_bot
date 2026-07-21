@@ -103,6 +103,8 @@ def _lookup_address(address: str, suggest_api_key: str, geocoder_api_key: str) -
             "apikey": suggest_api_key,
             "text": address,
             "lang": "ru",
+            "ll": "92.90,56.02",
+            "spn": "0.55,0.35",
             "print_address": "1",
             "attrs": "uri",
         },
